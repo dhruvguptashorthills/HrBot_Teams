@@ -1,4 +1,4 @@
-const { ActivityTypes } = require("@microsoft/agents-activity");
+const { ActivityTypes, CardFactory } = require("@microsoft/agents-activity");
 const {
   AgentApplication,
   AttachmentDownloader,
@@ -15,31 +15,27 @@ const teamsBot = new AgentApplication({
   fileDownloaders: [downloader],
 });
 
-// /reset
+// --- Basic Commands ---
 teamsBot.message("/reset", async (context, state) => {
   state.deleteConversationState();
   await context.sendActivity("✅ Conversation state has been reset.");
 });
 
-// /count
 teamsBot.message("/count", async (context, state) => {
   const count = state.conversation.count ?? 0;
   await context.sendActivity(`The count is ${count}`);
 });
 
-// /diag
 teamsBot.message("/diag", async (context, state) => {
   await state.load(context, storage);
   await context.sendActivity(JSON.stringify(context.activity));
 });
 
-// /state
 teamsBot.message("/state", async (context, state) => {
   await state.load(context, storage);
   await context.sendActivity(JSON.stringify(state));
 });
 
-// /runtime
 teamsBot.message("/runtime", async (context, state) => {
   const runtime = {
     nodeversion: process.version,
@@ -48,6 +44,7 @@ teamsBot.message("/runtime", async (context, state) => {
   await context.sendActivity(JSON.stringify(runtime));
 });
 
+// --- Main Feature: /search_candidates ---
 teamsBot.message(/^\/search_candidates\s+(.*)/i, async (context, state) => {
   const query = context.activity.text.replace(/^\/search_candidates\s+/i, "").trim();
 
@@ -65,68 +62,71 @@ teamsBot.message(/^\/search_candidates\s+(.*)/i, async (context, state) => {
     });
 
     const result = response.data;
+
     if (!result || !result.results || result.results.length === 0) {
       await context.sendActivity("⚠️ No candidates found.");
       return;
     }
 
-    // Limit to top 20 results
     const topResults = result.results.slice(0, 20);
 
-    const formattedResults = topResults.map((r, index) => {
-      const employeeId = r.filename.replace(".txt", "");
-
-      // Extract name using regex from r.text
+    for (const r of topResults) {
+      const rawText = r.text || "";
       let name = "Unknown";
-      const nameMatch = r.text.match(/name=([^,}]+)/i);
-      if (nameMatch && nameMatch[1]) {
-        name = nameMatch[1].trim();
-      }
+      let summary = "(No summary provided)";
+      let empId = r.filename.replace(".txt", "");
 
-      const textSnippet = r.text.split(/\s+/).slice(0, 10).join(" ") + " ...";
-
-      // Extract social_profiles if any (try-catch fallback)
-      let parsedText = {};
       try {
-        parsedText = JSON.parse(
-          r.text
-            .replace(/([{\[,])\s*([a-zA-Z0-9_]+)\s*=/g, '$1 "$2":') // quote keys
-            .replace(/=\s*([^,\]}]+)/g, ': "$1"')                  // convert = to :
-        );
-      } catch {
-        parsedText = {};
+        const nameMatch = rawText.match(/name\s*=\s*([^,}]+)/i);
+        if (nameMatch) name = nameMatch[1].trim();
+
+        const summaryMatch = rawText.match(/summary\s*=\s*([^,}]+)/i);
+        if (summaryMatch) summary = summaryMatch[1].trim();
+
+        const idMatch = rawText.match(/employee_id\s*=\s*([^,}]+)/i);
+        if (idMatch) empId = idMatch[1].trim();
+      } catch (err) {
+        // fallback already applied
       }
 
-      const profiles = Array.isArray(parsedText.social_profiles)
-        ? parsedText.social_profiles.map(p => `🔗 [${p.platform}](${p.link})`).join(" | ")
-        : "";
+      const card = {
+        type: "AdaptiveCard",
+        version: "1.4",
+        body: [
+          {
+            type: "TextBlock",
+            size: "Large",
+            weight: "Bolder",
+            text: `👤 ${name}`
+          },
+          {
+            type: "TextBlock",
+            text: `🆔 Employee ID: ${empId}`,
+            wrap: true
+          },
+          {
+            type: "TextBlock",
+            text: `📊 Score: ${r.score?.toFixed(4) ?? "N/A"}`,
+            wrap: true
+          },
+          {
+            type: "TextBlock",
+            text: `📝 Summary:\n${summary}`,
+            wrap: true
+          }
+        ],
+        $schema: "http://adaptivecards.io/schemas/adaptive-card.json"
+      };
 
-      return (
-        `🧑 *${name}*\n` +
-        `📄 *Employee ID:* \`${employeeId}\`\n` +
-        `- **Keyword Score:** ${r.keywordScore ?? "N/A"}\n` +
-        `- **Vector Score:** ${r.vectorScore ?? "N/A"}\n` +
-        `- **Hybrid Score:** ${r.hybridScore ?? "N/A"}\n` +
-        `- **Summary Snippet:** \`${textSnippet}\`\n` +
-        (profiles ? `- **Profiles:** ${profiles}` : "")
-      );
-    });
-
-    // Chunk messages to stay within Teams limits
-    const messageChunks = [];
-    let currentChunk = "";
-    for (const entry of formattedResults) {
-      if ((currentChunk + "\n\n" + entry).length > 3800) {
-        messageChunks.push(currentChunk);
-        currentChunk = entry;
-      } else {
-        currentChunk += `\n\n${entry}`;
-      }
-    }
-    if (currentChunk) messageChunks.push(currentChunk);
-
-    for (const chunk of messageChunks) {
-      await context.sendActivity(chunk);
+      await context.sendActivity({
+        type: "message",
+        attachments: [
+          {
+            contentType: "application/vnd.microsoft.card.adaptive",
+            content: card
+          }
+        ]
+      });
     }
 
   } catch (error) {
@@ -135,32 +135,26 @@ teamsBot.message(/^\/search_candidates\s+(.*)/i, async (context, state) => {
   }
 });
 
-
-
-
-
-
-
-// Greeting on member join
+// --- Greeting ---
 teamsBot.conversationUpdate("membersAdded", async (context, state) => {
   await context.sendActivity(
-    `👋 Hello! I’m your resume assistant bot running on SDK v${version}.\nTry \`/vector_search your query\` or \`/keyword_search your query\`.`
+    `👋 Hello! I’m your resume assistant bot running on SDK v${version}.\nTry \`/search_candidates python and nlp\`.`
   );
 });
 
-// Default message echo with counter
+// --- Default Echo with Count ---
 teamsBot.activity(ActivityTypes.Message, async (context, state) => {
   let count = state.conversation.count ?? 0;
   state.conversation.count = ++count;
   await context.sendActivity(`[${count}] You said: ${context.activity.text}`);
 });
 
-// Optional regex handler
+// --- Optional Regex Match Example ---
 teamsBot.activity(/^message/, async (context, state) => {
   await context.sendActivity(`Matched with regex: ${context.activity.type}`);
 });
 
-// Optional function handler
+// --- Optional Custom Function Match ---
 teamsBot.activity(
   async (context) => Promise.resolve(context.activity.type === "message"),
   async (context, state) => {
